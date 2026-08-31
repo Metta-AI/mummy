@@ -57,6 +57,7 @@ type
     clientSocket: SocketHandle
     clientId: uint64
     responded: bool
+    wsLimits: WebSocketLimits # Set by upgradeToWebSocket, read by respond
 
   Request* = ptr RequestObj
 
@@ -64,6 +65,14 @@ type
     server: Server
     clientSocket: SocketHandle
     clientId: uint64
+
+  WebSocketLimits* = object
+    ## Per-WebSocket transport limits, chosen when the connection is upgraded.
+    ## Every field defaults to 0, which preserves the server-wide behavior,
+    ## so existing callers are unaffected unless they opt in.
+    maxMessageLen*: int ## Maximum incoming message size for this WebSocket,
+                        ## checked from the frame header before the payload is
+                        ## buffered. 0 means use the server's maxMessageLen.
 
   Message* = object
     kind*: MessageKind
@@ -135,6 +144,7 @@ type
       upgradedToWebSocket, closeFrameSent: bool
       sendsWaitingForUpgrade: seq[OutgoingBuffer]
       requestCounter: int # Incoming request incs, outgoing response decs
+      wsLimits: WebSocketLimits # Applied when the upgrade response is processed
 
   IncomingRequestState = object
     headersParsed: bool
@@ -160,6 +170,7 @@ type
     closeConnection, isWebSocketUpgrade, isCloseFrame: bool
     buffer1, buffer2: string
     bytesSent: int
+    wsLimits: WebSocketLimits # Rides the upgrade response to the event loop
 
   WebSocketUpdate = object
     event: WebSocketEvent
@@ -396,6 +407,8 @@ proc respond*(
     "Upgrade",
     "websocket"
   )
+  if encodedResponse.isWebSocketUpgrade:
+    encodedResponse.wsLimits = request.wsLimits
 
   if statusCode < 100 or statusCode >= 200:
     # Mark if this request has received a non-informational (1xx) response
@@ -410,7 +423,8 @@ proc respond*(
     request.server.trigger(request.server.responseQueued)
 
 proc upgradeToWebSocket*(
-  request: Request
+  request: Request,
+  limits: WebSocketLimits = WebSocketLimits()
 ): WebSocket {.raises: [MummyError], gcsafe.} =
   ## Upgrades the request to a WebSocket connection. You can immediately start
   ## calling send().
@@ -418,6 +432,9 @@ proc upgradeToWebSocket*(
   ## provided to `newServer`. The first event will be onOpen.
   ## Note: if the client disconnects before receiving this upgrade response,
   ## no onOpen event will be received.
+  ## The optional limits apply to this WebSocket only and take effect before
+  ## any WebSocket frame from the client is processed. The default (all
+  ## zeroes) preserves the server-wide behavior.
   if not request.headers.headerContainsToken("Connection", "Upgrade"):
     raise newException(
       MummyError,
@@ -451,6 +468,8 @@ proc upgradeToWebSocket*(
     clientSocket: request.clientSocket,
     clientId: request.clientId
   )
+
+  request.wsLimits = limits
 
   let hash = sha1(websocketKey & "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
@@ -655,7 +674,12 @@ proc afterRecvWebSocket(
       # Per spec, control frames are only allowed payloads up to 125 bytes
       return true # Close the connection
 
-    if dataEntry.frameState.frameLen + payloadLen > server.maxMessageLen:
+    let maxMessageLen =
+      if dataEntry.wsLimits.maxMessageLen > 0:
+        dataEntry.wsLimits.maxMessageLen
+      else:
+        server.maxMessageLen
+    if dataEntry.frameState.frameLen + payloadLen > maxMessageLen:
       server.log(DebugLevel, "Dropped WebSocket, message too long")
       return true # Message is too large, close the connection
 
@@ -1204,6 +1228,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
               if server.tcpNoDelay:
                 server.setNoDelay(encodedResponse.clientSocket)
               clientDataEntry.upgradedToWebSocket = true
+              clientDataEntry.wsLimits = encodedResponse.wsLimits
               let websocket = WebSocket(
                 server: server,
                 clientSocket: encodedResponse.clientSocket,
