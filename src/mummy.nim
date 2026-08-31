@@ -80,6 +80,24 @@ type
     maxPendingBytes*: int ## Maximum total payload bytes across those queued
                           ## message events. Exceeding this closes the
                           ## connection. 0 means unlimited.
+    maxOutboundEvents*: int ## Maximum admitted-but-unsent outbound messages
+                            ## for this WebSocket; trySend refuses to admit
+                            ## more. 0 means unlimited.
+    maxOutboundBytes*: int ## Maximum admitted-but-unsent outbound bytes
+                           ## (frame header plus payload) for this WebSocket;
+                           ## trySend refuses to admit more. 0 means
+                           ## unlimited.
+
+  SendCompletion* = enum
+    SendSent    ## The message was fully handed to the operating system.
+                ## This is not proof of delivery to the client.
+    SendDropped ## The connection closed, or the message was discarded,
+                ## before it was fully handed to the operating system.
+
+  SendCallback* = proc(
+    websocket: WebSocket,
+    completion: SendCompletion
+  ) {.gcsafe.}
 
   Message* = object
     kind*: MessageKind
@@ -123,6 +141,8 @@ type
     websocketClaimed: Table[WebSocket, bool]
     websocketQueues: Table[WebSocket, WebSocketQueue]
     websocketQueuesLock: Lock
+    outboundStates: Table[WebSocket, OutboundState]
+    outboundLock: Lock
 
   Server* = ptr ServerObj
 
@@ -178,6 +198,8 @@ type
     buffer1, buffer2: string
     bytesSent: int
     wsLimits: WebSocketLimits # Rides the upgrade response to the event loop
+    onCompletion: SendCallback # Fired once when sent or dropped, may be nil
+    countedOutbound: bool # This buffer holds an outbound cap reservation
 
   WebSocketUpdate = object
     event: WebSocketEvent
@@ -191,6 +213,13 @@ type
     maxPendingEvents, maxPendingBytes: int
     pendingEvents, pendingBytes: int
     breached: bool
+
+  OutboundState {.acyclic.} = ref object
+    # Outbound cap accounting for one WebSocket. Guarded by outboundLock.
+    # Bytes count buffer1 + buffer2 (frame header plus payload) of every
+    # admitted message until it has been fully handed to the OS.
+    maxEvents, maxBytes: int
+    pendingEvents, pendingBytes: int
 
 proc `$`*(request: Request): string {.gcsafe.} =
   result = request.httpMethod & " " & request.uri & " "
@@ -286,29 +315,31 @@ proc setNoDelay(
       "Error setting TCP_NODELAY: ", e.msg
     )
 
-proc send*(
+proc encodeWebSocketFrame(
   websocket: WebSocket,
   data: sink string,
-  kind = TextMessage,
-) {.raises: [], gcsafe.} =
-  ## Enqueues the message to be sent over the WebSocket connection.
-
-  var encodedFrame = OutgoingBuffer()
-  encodedFrame.clientSocket = websocket.clientSocket
-  encodedFrame.clientId = websocket.clientId
+  kind: MessageKind
+): OutgoingBuffer {.raises: [], gcsafe.} =
+  result = OutgoingBuffer()
+  result.clientSocket = websocket.clientSocket
+  result.clientId = websocket.clientId
 
   case kind:
   of TextMessage:
-    encodedFrame.buffer1 = encodeFrameHeader(0x1, data.len)
+    result.buffer1 = encodeFrameHeader(0x1, data.len)
   of BinaryMessage:
-    encodedFrame.buffer1 = encodeFrameHeader(0x2, data.len)
+    result.buffer1 = encodeFrameHeader(0x2, data.len)
   of Ping:
-    encodedFrame.buffer1 = encodeFrameHeader(0x9, data.len)
+    result.buffer1 = encodeFrameHeader(0x9, data.len)
   of Pong:
-    encodedFrame.buffer1 = encodeFrameHeader(0xA, data.len)
+    result.buffer1 = encodeFrameHeader(0xA, data.len)
 
-  encodedFrame.buffer2 = move data
+  result.buffer2 = move data
 
+proc enqueueWebSocketSend(
+  websocket: WebSocket,
+  encodedFrame: sink OutgoingBuffer
+) {.raises: [], gcsafe.} =
   var queueWasEmpty: bool
   withLock websocket.server.sendQueueLock:
     queueWasEmpty = websocket.server.sendQueue.len == 0
@@ -316,6 +347,108 @@ proc send*(
 
   if queueWasEmpty:
     websocket.server.trigger(websocket.server.sendQueued)
+
+proc send*(
+  websocket: WebSocket,
+  data: sink string,
+  kind = TextMessage,
+) {.raises: [], gcsafe.} =
+  ## Enqueues the message to be sent over the WebSocket connection.
+  websocket.enqueueWebSocketSend(
+    websocket.encodeWebSocketFrame(move data, kind)
+  )
+
+proc trySend*(
+  websocket: WebSocket,
+  data: sink string,
+  kind = TextMessage,
+  onCompletion: SendCallback = nil
+): bool {.raises: [], gcsafe.} =
+  ## Sends a message like send, but subject to this WebSocket's outbound caps
+  ## (WebSocketLimits.maxOutboundEvents / maxOutboundBytes). If admitting the
+  ## message would exceed a cap it is refused: nothing is enqueued and false
+  ## is returned. The caps count every admitted message, wherever it is
+  ## buffered inside the server, until it has been fully handed to the
+  ## operating system. Without outbound caps configured trySend always
+  ## admits.
+  ##
+  ## If onCompletion is provided it is invoked exactly once per admitted
+  ## message: with SendSent once the message has been fully handed to the
+  ## operating system (not proof of delivery to the client), or with
+  ## SendDropped if the connection closes or the message is discarded before
+  ## that. The callback runs on the server's event loop thread and must not
+  ## block; prefer a non-capturing proc. If the server itself is closed with
+  ## messages still queued, callbacks for those messages are not invoked.
+
+  var encodedFrame = websocket.encodeWebSocketFrame(move data, kind)
+  encodedFrame.onCompletion = onCompletion
+
+  let frameLen = encodedFrame.buffer1.len + encodedFrame.buffer2.len
+  withLock websocket.server.outboundLock:
+    let state = websocket.server.outboundStates.getOrDefault(websocket, nil)
+    if state != nil:
+      let
+        overEvents = state.maxEvents > 0 and
+          state.pendingEvents + 1 > state.maxEvents
+        overBytes = state.maxBytes > 0 and
+          state.pendingBytes + frameLen > state.maxBytes
+      if overEvents or overBytes:
+        return false
+      state.pendingEvents += 1
+      state.pendingBytes += frameLen
+      encodedFrame.countedOutbound = true
+
+  websocket.enqueueWebSocketSend(move encodedFrame)
+  true
+
+proc completeOutgoingBuffer(
+  server: Server,
+  buffer: OutgoingBuffer,
+  completion: SendCompletion
+) {.raises: [].} =
+  # Fires exactly once per buffer admitted through trySend: frees the
+  # outbound cap reservation and invokes the completion callback. Must be
+  # called without outboundLock held (the callback may call trySend).
+  if not buffer.countedOutbound and buffer.onCompletion == nil:
+    return
+  let websocket = WebSocket(
+    server: server,
+    clientSocket: buffer.clientSocket,
+    clientId: buffer.clientId
+  )
+  if buffer.countedOutbound:
+    buffer.countedOutbound = false # Complete at most once
+    withLock server.outboundLock:
+      let state = server.outboundStates.getOrDefault(websocket, nil)
+      if state != nil:
+        state.pendingEvents -= 1
+        state.pendingBytes -= buffer.buffer1.len + buffer.buffer2.len
+  if buffer.onCompletion != nil:
+    let onCompletion = buffer.onCompletion
+    buffer.onCompletion = nil # Complete at most once
+    try:
+      onCompletion(websocket, completion)
+    except Exception as e:
+      server.log(
+        ErrorLevel,
+        "Send completion callback exception: " & e.msg
+      )
+
+proc removeDroppedUpgradeState(
+  server: Server,
+  encodedResponse: OutgoingBuffer
+) {.raises: [].} =
+  # An upgrade response was dropped because the client disconnected before it
+  # was processed. The outbound cap state upgradeToWebSocket created for that
+  # WebSocket will never be reached again, remove it.
+  if not encodedResponse.isWebSocketUpgrade:
+    return
+  withLock server.outboundLock:
+    server.outboundStates.del(WebSocket(
+      server: server,
+      clientSocket: encodedResponse.clientSocket,
+      clientId: encodedResponse.clientId
+    ))
 
 proc close*(websocket: WebSocket) {.raises: [], gcsafe.} =
   ## Begins the WebSocket closing handshake.
@@ -486,6 +619,17 @@ proc upgradeToWebSocket*(
   )
 
   request.wsLimits = limits
+
+  if limits.maxOutboundEvents > 0 or limits.maxOutboundBytes > 0:
+    # Created before the upgrade response is queued so no trySend on this
+    # WebSocket can ever run without its caps in place. If the client is
+    # already gone the entry is removed when the upgrade response is dropped,
+    # or when the socket is cleaned up.
+    withLock request.server.outboundLock:
+      request.server.outboundStates[result] = OutboundState(
+        maxEvents: limits.maxOutboundEvents,
+        maxBytes: limits.maxOutboundBytes
+      )
 
   let hash = sha1(websocketKey & "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
@@ -1177,6 +1321,7 @@ proc afterSend(
     # The current outgoing buffer for this socket has been fully sent
     # Remove it from the outgoing buffer queue
     dataEntry.outgoingBuffers.shrink(fromFirst = 1)
+    server.completeOutgoingBuffer(outgoingBuffer, SendSent)
     if outgoingBuffer.isCloseFrame:
       dataEntry.closeFrameSent = true
     if outgoingBuffer.closeConnection:
@@ -1205,6 +1350,7 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     deinitLock(server.responseQueueLock)
     deinitLock(server.sendQueueLock)
     deinitLock(server.websocketQueuesLock)
+    deinitLock(server.outboundLock)
     try:
       server.responseQueued.close()
     except Exception as e:
@@ -1301,6 +1447,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
                 for encodedFrame in clientDataEntry.sendsWaitingForUpgrade:
                   if clientDataEntry.closeFrameQueuedAt > 0:
                     server.log(DebugLevel, "Dropped message after WebSocket close")
+                    server.completeOutgoingBuffer(encodedFrame, SendDropped)
                   else:
                     clientDataEntry.outgoingBuffers.addLast(encodedFrame)
                     if encodedFrame.isCloseFrame:
@@ -1309,8 +1456,10 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           else:
             # Was this file descriptor reused for a different client?
             server.log(DebugLevel, "Dropped response to disconnected client")
+            server.removeDroppedUpgradeState(encodedResponse)
         else:
           server.log(DebugLevel, "Dropped response to disconnected client")
+          server.removeDroppedUpgradeState(encodedResponse)
 
     if sendQueuedTriggered:
       # If we have any sends queued move them to the outgoing buffer queue of
@@ -1329,6 +1478,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
             if clientDataEntry.upgradedToWebSocket:
               if clientDataEntry.closeFrameQueuedAt > 0:
                 server.log(DebugLevel, "Dropped message after WebSocket close")
+                server.completeOutgoingBuffer(encodedFrame, SendDropped)
               else:
                 clientDataEntry.outgoingBuffers.addLast(encodedFrame)
                 if encodedFrame.isCloseFrame:
@@ -1343,8 +1493,10 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           else:
             # Was this file descriptor reused for a different client?
             server.log(DebugLevel, "Dropped message to disconnected client")
+            server.completeOutgoingBuffer(encodedFrame, SendDropped)
         else:
           server.log(DebugLevel, "Dropped message to disconnected client")
+          server.completeOutgoingBuffer(encodedFrame, SendDropped)
 
     if shutdownTriggered:
       server.destroy(true)
@@ -1475,6 +1627,26 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
       finally:
         clientSocket.close()
         server.clientSockets.excl(clientSocket)
+      # Cancel this socket's outbound cap state, then complete its queued
+      # buffers. Removing the state first makes the cancellation atomic: a
+      # concurrent trySend either reserved before this (its buffer is
+      # completed here or on the disconnected-client drop path) or finds no
+      # state. Every admitted buffer gets exactly one completion.
+      withLock server.outboundLock:
+        server.outboundStates.del(WebSocket(
+          server: server,
+          clientSocket: clientSocket,
+          clientId: dataEntry.clientId
+        ))
+      for buffer in dataEntry.outgoingBuffers:
+        let completion =
+          if buffer.bytesSent == buffer.buffer1.len + buffer.buffer2.len:
+            SendSent # Fully handed to the OS, afterSend just never ran
+          else:
+            SendDropped
+        server.completeOutgoingBuffer(buffer, completion)
+      for buffer in dataEntry.sendsWaitingForUpgrade:
+        server.completeOutgoingBuffer(buffer, SendDropped)
       if dataEntry.upgradedToWebSocket:
         let websocket = WebSocket(
           server: server,
@@ -1615,6 +1787,7 @@ proc newServer*(
     initLock(result.responseQueueLock)
     initLock(result.sendQueueLock)
     initLock(result.websocketQueuesLock)
+    initLock(result.outboundLock)
 
     for i in 0 ..< workerThreads:
       createThread(result.workerThreads[i], workerProc, result)
