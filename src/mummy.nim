@@ -73,6 +73,13 @@ type
     maxMessageLen*: int ## Maximum incoming message size for this WebSocket,
                         ## checked from the frame header before the payload is
                         ## buffered. 0 means use the server's maxMessageLen.
+    maxPendingEvents*: int ## Maximum client-originated message events (text,
+                           ## binary, ping and pong alike) queued for dispatch
+                           ## to the WebSocket handler. Exceeding this closes
+                           ## the connection. 0 means unlimited.
+    maxPendingBytes*: int ## Maximum total payload bytes across those queued
+                          ## message events. Exceeding this closes the
+                          ## connection. 0 means unlimited.
 
   Message* = object
     kind*: MessageKind
@@ -114,7 +121,7 @@ type
     sendQueue: Deque[OutgoingBuffer]
     sendQueueLock: Lock
     websocketClaimed: Table[WebSocket, bool]
-    websocketQueues: Table[WebSocket, Deque[WebSocketUpdate]]
+    websocketQueues: Table[WebSocket, WebSocketQueue]
     websocketQueuesLock: Lock
 
   Server* = ptr ServerObj
@@ -175,6 +182,15 @@ type
   WebSocketUpdate = object
     event: WebSocketEvent
     message: Message
+
+  WebSocketQueue {.acyclic.} = ref object
+    # Pending updates for one WebSocket, plus its pending caps. The counters
+    # only track MessageEvent updates: OpenEvent and the terminal error/close
+    # notification are exempt from the caps (a client cannot flood those).
+    updates: Deque[WebSocketUpdate]
+    maxPendingEvents, maxPendingBytes: int
+    pendingEvents, pendingBytes: int
+    breached: bool
 
 proc `$`*(request: Request): string {.gcsafe.} =
   result = request.httpMethod & " " & request.uri & " "
@@ -510,9 +526,13 @@ proc workerProc(server: Server) {.raises: [].} =
         var update: Option[WebSocketUpdate]
         withLock server.websocketQueuesLock:
           try:
-            if server.websocketQueues[task.websocket].len > 0:
-              update = some(server.websocketQueues[task.websocket].popFirst())
-              if update.get.event == CloseEvent:
+            let queue = server.websocketQueues[task.websocket]
+            if queue.updates.len > 0:
+              update = some(queue.updates.popFirst())
+              if update.get.event == MessageEvent:
+                queue.pendingEvents -= 1
+                queue.pendingBytes -= update.get.message.data.len
+              elif update.get.event == CloseEvent:
                 server.websocketQueues.del(task.websocket)
                 server.websocketClaimed.del(task.websocket)
             else:
@@ -570,19 +590,50 @@ proc postTask(server: Server, task: WorkerTask) {.raises: [].} =
 proc postWebSocketUpdate(
   websocket: WebSocket,
   update: sink WebSocketUpdate
-) {.raises: [].} =
+): bool {.raises: [].} =
+  ## Returns true if this update breached the WebSocket's pending caps.
+  ## The caller must then close the connection, which dispatches the terminal
+  ## error/close notification exactly once; the queue itself is only removed
+  ## after that CloseEvent has been dispatched to the handler.
   if websocket.server.websocketHandler == nil:
     websocket.server.log(DebugLevel, "WebSocket event but no WebSocket handler")
-    return
+    return false
 
   var needsTask: bool
 
   withLock websocket.server.websocketQueuesLock:
     if websocket notin websocket.server.websocketQueues:
-      return
+      return false
 
     try:
-      websocket.server.websocketQueues[websocket].addLast(move update)
+      let queue = websocket.server.websocketQueues[websocket]
+      if update.event == MessageEvent:
+        if queue.breached:
+          # The caps were already breached and the connection is closing,
+          # reject any further message events
+          return false
+        let
+          overEvents = queue.maxPendingEvents > 0 and
+            queue.pendingEvents + 1 > queue.maxPendingEvents
+          overBytes = queue.maxPendingBytes > 0 and
+            queue.pendingBytes + update.message.data.len > queue.maxPendingBytes
+        if overEvents or overBytes:
+          # One atomic transition: reject this event, purge the queued message
+          # events and mark the queue breached so no more are accepted. Only
+          # non-message updates (an undispatched OpenEvent) survive the purge.
+          var kept: Deque[WebSocketUpdate]
+          while queue.updates.len > 0:
+            var queued = queue.updates.popFirst()
+            if queued.event != MessageEvent:
+              kept.addLast(move queued)
+          queue.updates = move kept
+          queue.pendingEvents = 0
+          queue.pendingBytes = 0
+          queue.breached = true
+          return true
+        queue.pendingEvents += 1
+        queue.pendingBytes += update.message.data.len
+      queue.updates.addLast(move update)
       if not websocket.server.websocketClaimed[websocket]:
         needsTask = true
     except KeyError:
@@ -773,7 +824,9 @@ proc afterRecvWebSocket(
           event: MessageEvent,
           message: move message
         )
-      websocket.postWebSocketUpdate(update)
+      if websocket.postWebSocketUpdate(update):
+        server.log(DebugLevel, "Dropped WebSocket, pending caps exceeded")
+        return true # Pending caps breached, close the connection
 
 proc popRequest(
   server: Server,
@@ -1235,9 +1288,14 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
                 clientId: encodedResponse.clientId
               )
               withLock server.websocketQueuesLock:
-                server.websocketQueues[websocket] = initDeque[WebSocketUpdate]()
+                server.websocketQueues[websocket] = WebSocketQueue(
+                  maxPendingEvents: encodedResponse.wsLimits.maxPendingEvents,
+                  maxPendingBytes: encodedResponse.wsLimits.maxPendingBytes
+                )
                 server.websocketClaimed[websocket] = false
-              websocket.postWebSocketUpdate(WebSocketUpdate(event: OpenEvent))
+              discard websocket.postWebSocketUpdate(
+                WebSocketUpdate(event: OpenEvent)
+              )
               # Are there any sends that were waiting for this response?
               if clientDataEntry.sendsWaitingForUpgrade.len > 0:
                 for encodedFrame in clientDataEntry.sendsWaitingForUpgrade:
@@ -1425,9 +1483,9 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
         )
         if not dataEntry.closeFrameSent:
           var error = WebSocketUpdate(event: ErrorEvent)
-          websocket.postWebSocketUpdate(error)
+          discard websocket.postWebSocketUpdate(error)
         var close = WebSocketUpdate(event: CloseEvent)
-        websocket.postWebSocketUpdate(close)
+        discard websocket.postWebSocketUpdate(close)
 
 proc close*(server: Server) {.raises: [], gcsafe.} =
   ## Cleanly stops and deallocates the server.

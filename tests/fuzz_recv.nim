@@ -274,7 +274,7 @@ block:
         clientSocket = 1.SocketHandle
         websocket = WebSocket(server: server, clientSocket: clientSocket)
 
-      server.websocketQueues[websocket] = initDeque[WebSocketUpdate]()
+      server.websocketQueues[websocket] = WebSocketQueue()
       server.websocketClaimed[websocket] = false
 
       let closingConnection = server.afterRecvWebSocket(
@@ -299,7 +299,7 @@ block:
         clientSocket = 1.SocketHandle
         websocket = WebSocket(server: server, clientSocket: clientSocket)
 
-      server.websocketQueues[websocket] = initDeque[WebSocketUpdate]()
+      server.websocketQueues[websocket] = WebSocketQueue()
       server.websocketClaimed[websocket] = false
 
       var combined: string
@@ -355,7 +355,7 @@ block:
 
       doAssert task.websocket == websocket
 
-      let update = server.websocketQueues[websocket].popFirst()
+      let update = server.websocketQueues[websocket].updates.popFirst()
 
       doAssert update.event == MessageEvent
       doAssert update.message.kind == TextMessage
