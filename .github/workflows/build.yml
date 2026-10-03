@@ -15,6 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: treeform/setup-nim-action@v6
+      - name: Create explicit Nimby workspace
+        working-directory: ..
+        run: nimby create
       - run: nimby install -g mummy.nimble
       - run: nimby install -g whisky
       - run: nimby install -g jsony
