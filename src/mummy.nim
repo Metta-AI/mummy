@@ -110,6 +110,8 @@ type
 
   Server* = ptr ServerObj
 
+  ServerReadyHandler* = proc(server: Server) {.gcsafe, raises: [ResourceExhaustedError].}
+
   WorkerTask = object
     request: Request
     websocket: WebSocket
@@ -1414,13 +1416,17 @@ proc close*(server: Server) {.raises: [], gcsafe.} =
 proc serve*(
   server: Server,
   port: Port,
-  address = "localhost"
+  address = "localhost",
+  onReady: ServerReadyHandler = nil
 ) {.raises: [MummyError].} =
   ## The server will serve on the address and port. The default address is
   ## localhost. Use "0.0.0.0" to make the server externally accessible (with
   ## caution).
   ## This call does not return unless server.close() is called from another
-  ## thread.
+  ## thread. `onReady` runs once on this thread after listening and selector
+  ## registration succeed. Start owned work there; do not block the serving loop.
+  ## It is never called when startup fails. Calling close in the callback queues
+  ## normal shutdown; the server is already initialized.
 
   if server.socket.int != 0:
     raise newException(MummyError, "Server already has a socket")
@@ -1456,11 +1462,12 @@ proc serve*(
 
     let dataEntry = DataEntry(kind: ServerSocketEntry)
     server.selector.registerHandle2(server.socket, {Read}, dataEntry)
+    server.serving.store(true, moRelaxed)
+    if onReady != nil:
+      onReady(server)
   except Exception as e:
     server.destroy(true)
     raise currentExceptionAsMummyError()
-
-  server.serving.store(true, moRelaxed)
 
   try:
     server.loopForever()

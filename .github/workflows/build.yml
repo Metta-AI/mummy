@@ -29,3 +29,8 @@ jobs:
       - run: nim r tests/test_http2.nim
       - run: nim r tests/test_websockets.nim
       - run: nim r -d:mummyNoWorkers tests/fuzz_recv.nim
+      - name: Verify listener readiness and owned shutdown
+        if: runner.os == 'Linux'
+        run: |
+          nim c --threads:on --mm:orc --path:src -o:/tmp/serve-ready-probe tests/support/serve_ready_probe.nim
+          python3 tests/test_serve_ready.py /tmp/serve-ready-probe
