@@ -91,6 +91,7 @@ type
     tcpNoDelay: bool
     rand: Rand
     workerThreads: seq[Thread[Server]]
+    selectEventsInitialized: range[0 .. 3]
     serving: Atomic[bool]
     destroyCalled: bool
     socket: SocketHandle
@@ -1130,18 +1131,12 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     deinitLock(server.responseQueueLock)
     deinitLock(server.sendQueueLock)
     deinitLock(server.websocketQueuesLock)
-    try:
-      server.responseQueued.close()
-    except Exception as e:
-      discard # Ignore
-    try:
-      server.sendQueued.close()
-    except Exception as e:
-      discard # Ignore
-    try:
-      server.shutdown.close()
-    except Exception as e:
-      discard # Ignore
+    for index in 0 ..< server.selectEventsInitialized:
+      let event = [server.responseQueued, server.sendQueued, server.shutdown][index]
+      try:
+        event.close()
+      except Exception as e:
+        discard # Ignore
     `=destroy`(server[])
     deallocShared(server)
   else:
@@ -1510,13 +1505,23 @@ proc newServer*(
   result.tcpNoDelay = tcpNoDelay
   result.rand = initRand()
 
+  initLock(result.taskQueueLock)
+  initCond(result.taskQueueCond)
+  initLock(result.responseQueueLock)
+  initLock(result.sendQueueLock)
+  initLock(result.websocketQueuesLock)
+
   result.workerThreads.setLen(workerThreads)
+  var createdWorkerThreads = 0
 
   # Stuff that can fail
   try:
     result.responseQueued = newSelectEvent()
+    inc result.selectEventsInitialized
     result.sendQueued = newSelectEvent()
+    inc result.selectEventsInitialized
     result.shutdown = newSelectEvent()
+    inc result.selectEventsInitialized
 
     result.selector = newSelector[DataEntry]()
 
@@ -1532,15 +1537,11 @@ proc newServer*(
     shutdownData.event = result.shutdown
     result.selector.registerEvent(result.shutdown, shutdownData)
 
-    initLock(result.taskQueueLock)
-    initCond(result.taskQueueCond)
-    initLock(result.responseQueueLock)
-    initLock(result.sendQueueLock)
-    initLock(result.websocketQueuesLock)
-
     for i in 0 ..< workerThreads:
       createThread(result.workerThreads[i], workerProc, result)
+      inc createdWorkerThreads
   except Exception as e:
+    result.workerThreads.setLen(createdWorkerThreads)
     result.log(ErrorLevel, "Server construction failed: " & e.msg)
     result.destroy(true)
     raise currentExceptionAsMummyError()

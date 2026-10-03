@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 probe = Path(sys.argv[1]).resolve()
-for mode in ("normal", "before-listen", "bind-failure"):
+for mode in ("normal", "before-listen", "bind-failure", "allocation-4", "allocation-5", "allocation-6"):
     with socket.socket() as reserved:
         reserved.bind(("127.0.0.1", 0))
         port = reserved.getsockname()[1]
@@ -15,7 +15,12 @@ for mode in ("normal", "before-listen", "bind-failure"):
             reserved.listen()
         else:
             reserved.close()
-        process = subprocess.Popen([str(probe), mode, str(port)], stdin=subprocess.PIPE,
+        allocation = mode.startswith("allocation-")
+        command = [str(probe), "allocation-failure" if allocation else mode, str(port)]
+        if allocation:
+            limit = mode.split("-")[1]
+            command = ["prlimit", f"--nofile={limit}:{limit}"] + command
+        process = subprocess.Popen(command, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if mode == "before-listen":
@@ -35,7 +40,8 @@ for mode in ("normal", "before-listen", "bind-failure"):
                 process.send_signal(signal.SIGINT)
             stdout, stderr = process.communicate(timeout=5)
             assert process.returncode == 0, stderr
-            expected = "BIND_FAILED_WITHOUT_OWNER" if mode == "bind-failure" else "SEALED_AND_JOINED"
+            expected = ("ALLOCATION_FAILED_WITHOUT_OWNER" if allocation else
+                        "BIND_FAILED_WITHOUT_OWNER" if mode == "bind-failure" else "SEALED_AND_JOINED")
             assert expected in stdout, stdout
             print(mode, expected, flush=True)
         finally:

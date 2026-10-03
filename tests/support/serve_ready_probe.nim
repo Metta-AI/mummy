@@ -35,6 +35,19 @@ proc handler(request: Request) =
   request.respond(200, body = "actual-ready")
 
 let args = commandLineParams()
+if args[0] == "allocation-failure":
+  for index in 0 ..< 3:
+    doAssertRaises(MummyError):
+      discard newServer(handler, workerThreads = 1)
+  doAssert readyCount == 0 and not ownerCreated
+  echo "ALLOCATION_FAILED_WITHOUT_OWNER"
+  quit(0)
+if args[0] == "worker-failure":
+  doAssertRaises(MummyError):
+    discard newServer(handler, workerThreads = 2)
+  doAssert readyCount == 0 and not ownerCreated
+  echo "WORKER_ALLOCATION_FAILED_WITHOUT_OWNER"
+  quit(0)
 let server = newServer(handler, workerThreads = 1)
 if args[0] == "before-listen":
   echo "CONSTRUCTED"
