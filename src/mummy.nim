@@ -91,6 +91,7 @@ type
     tcpNoDelay: bool
     rand: Rand
     workerThreads: seq[Thread[Server]]
+    selectEventsInitialized: range[0 .. 3]
     serving: Atomic[bool]
     destroyCalled: bool
     socket: SocketHandle
@@ -109,6 +110,8 @@ type
     websocketQueuesLock: Lock
 
   Server* = ptr ServerObj
+
+  ServerReadyHandler* = proc(server: Server) {.gcsafe, raises: [ResourceExhaustedError].}
 
   WorkerTask = object
     request: Request
@@ -1128,18 +1131,12 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     deinitLock(server.responseQueueLock)
     deinitLock(server.sendQueueLock)
     deinitLock(server.websocketQueuesLock)
-    try:
-      server.responseQueued.close()
-    except Exception as e:
-      discard # Ignore
-    try:
-      server.sendQueued.close()
-    except Exception as e:
-      discard # Ignore
-    try:
-      server.shutdown.close()
-    except Exception as e:
-      discard # Ignore
+    for index in 0 ..< server.selectEventsInitialized:
+      let event = [server.responseQueued, server.sendQueued, server.shutdown][index]
+      try:
+        event.close()
+      except Exception as e:
+        discard # Ignore
     `=destroy`(server[])
     deallocShared(server)
   else:
@@ -1414,13 +1411,17 @@ proc close*(server: Server) {.raises: [], gcsafe.} =
 proc serve*(
   server: Server,
   port: Port,
-  address = "localhost"
+  address = "localhost",
+  onReady: ServerReadyHandler = nil
 ) {.raises: [MummyError].} =
   ## The server will serve on the address and port. The default address is
   ## localhost. Use "0.0.0.0" to make the server externally accessible (with
   ## caution).
   ## This call does not return unless server.close() is called from another
-  ## thread.
+  ## thread. `onReady` runs once on this thread after listening and selector
+  ## registration succeed. Start owned work there; do not block the serving loop.
+  ## It is never called when startup fails. Calling close in the callback queues
+  ## normal shutdown; the server is already initialized.
 
   if server.socket.int != 0:
     raise newException(MummyError, "Server already has a socket")
@@ -1456,11 +1457,12 @@ proc serve*(
 
     let dataEntry = DataEntry(kind: ServerSocketEntry)
     server.selector.registerHandle2(server.socket, {Read}, dataEntry)
+    server.serving.store(true, moRelaxed)
+    if onReady != nil:
+      onReady(server)
   except Exception as e:
     server.destroy(true)
     raise currentExceptionAsMummyError()
-
-  server.serving.store(true, moRelaxed)
 
   try:
     server.loopForever()
@@ -1503,13 +1505,23 @@ proc newServer*(
   result.tcpNoDelay = tcpNoDelay
   result.rand = initRand()
 
+  initLock(result.taskQueueLock)
+  initCond(result.taskQueueCond)
+  initLock(result.responseQueueLock)
+  initLock(result.sendQueueLock)
+  initLock(result.websocketQueuesLock)
+
   result.workerThreads.setLen(workerThreads)
+  var createdWorkerThreads = 0
 
   # Stuff that can fail
   try:
     result.responseQueued = newSelectEvent()
+    inc result.selectEventsInitialized
     result.sendQueued = newSelectEvent()
+    inc result.selectEventsInitialized
     result.shutdown = newSelectEvent()
+    inc result.selectEventsInitialized
 
     result.selector = newSelector[DataEntry]()
 
@@ -1525,15 +1537,12 @@ proc newServer*(
     shutdownData.event = result.shutdown
     result.selector.registerEvent(result.shutdown, shutdownData)
 
-    initLock(result.taskQueueLock)
-    initCond(result.taskQueueCond)
-    initLock(result.responseQueueLock)
-    initLock(result.sendQueueLock)
-    initLock(result.websocketQueuesLock)
-
     for i in 0 ..< workerThreads:
       createThread(result.workerThreads[i], workerProc, result)
+      inc createdWorkerThreads
   except Exception as e:
+    result.workerThreads.setLen(createdWorkerThreads)
+    result.log(ErrorLevel, "Server construction failed: " & e.msg)
     result.destroy(true)
     raise currentExceptionAsMummyError()
 
