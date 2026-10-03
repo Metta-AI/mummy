@@ -1541,6 +1541,7 @@ proc newServer*(
     for i in 0 ..< workerThreads:
       createThread(result.workerThreads[i], workerProc, result)
   except Exception as e:
+    result.log(ErrorLevel, "Server construction failed: " & e.msg)
     result.destroy(true)
     raise currentExceptionAsMummyError()
 
